@@ -532,7 +532,7 @@ void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str) {
     config->num_layers = depth;
     config->channels = channels;
     config->num_heads = num_heads;
-    config->max_seq_len = 1024;
+    config->max_seq_len = 512;
 }
 
 void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
@@ -1377,7 +1377,7 @@ void error_usage() {
     fprintf(stderr, "  -y <int>    resume optimization found inside output log dir? (0=restart/overwrite, 1=resume/append)\n");
     // token layout for each step of the optimization
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
-    fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
+    fprintf(stderr, "  -t <int>    sequence length T (default = 512)\n");
     fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
     // workload (number of steps)
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
@@ -1428,7 +1428,7 @@ int main(int argc, char *argv[]) {
     int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
     int B = 4; // batch size
-    int T = 1024; // sequence length max
+    int T = 512; // sequence length max
     int total_batch_size = -1; // will be calculated down below later, if not provided
     float learning_rate = 3e-4f;
     int log_gpu_every = -1;
@@ -1696,7 +1696,7 @@ int main(int argc, char *argv[]) {
         printf0("This will lead to unused parameters in the wpe position embedding weights.\n");
         printf0("If you know what you're doing you can ignore this warning.\n");
         printf0("If you're like ???, you are most likely misconfiguring your training run.\n");
-        printf0("---> HINT: If you're training GPT-2 use -t 1024. If GPT-3, use -t 2048.\n");
+        printf0("---> HINT: GPT-2 supports up to -t 1024 (this repo defaults to -t 512). GPT-3 supports up to -t 2048.\n");
         printf0("!!!!!!!!\n");
     }
     // in any case, this must be true or we'd index beyond the model's wpe (position embedding table)
