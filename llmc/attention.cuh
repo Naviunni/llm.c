@@ -372,7 +372,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
-void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
+void attention_backward(floatX* dqkvr_out, floatX* dpreatt_unused, floatX* datt, floatX* scratch,
                         const floatX* dout,
                         const floatX* qkvr, const floatX* att,
                         int B, int T, int C, int NH, cudaStream_t stream,
@@ -408,8 +408,8 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     matmul_cublaslt(dk, q, dpreatt, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
     // undo RoPE rotation for dq, dk before permuting back
     if (use_rope) { apply_rope_qk_backward(dq, dk, B, T, C, NH, rope_theta, stream); }
-    // backward into inp
+    // write gradients wrt QKV back to packed (B,T,3C)
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
-    permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);
+    permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dqkvr_out, dq, dk, dv, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
