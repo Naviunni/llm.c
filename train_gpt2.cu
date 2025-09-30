@@ -1018,9 +1018,16 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         #endif
         cudaCheck(cudaMemcpyAsync(&model->mean_loss, model->accumulated_mean_loss, sizeof(float), cudaMemcpyDeviceToHost, main_stream));
         // reduce the gradients for non-transformer block parameters
-        floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
-        const size_t nelem[] = {Vp * C, T * C, C, C};
-        multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+        if (model->use_rope) {
+            // no absolute WPE in RoPE mode
+            floatX* const pointers[] = {grads.wte, grads.lnfw, grads.lnfb};
+            const size_t nelem[] = {Vp * C, C, C};
+            multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+        } else {
+            floatX* const pointers[] = {grads.wte, grads.wpe, grads.lnfw, grads.lnfb};
+            const size_t nelem[] = {Vp * C, (size_t)model->config.max_seq_len * C, C, C};
+            multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+        }
     }
 
     cudaCheck(cudaDeviceSynchronize());
