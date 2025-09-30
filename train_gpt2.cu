@@ -56,6 +56,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 // defines: attention_forward, attention_backward
 #include "llmc/attention.cuh"
 #endif
+// RoPE kernels (standalone, independent of cuDNN/non-cuDNN attention)
+#include "llmc/rope.cuh"
 // defines: fused_classifier
 #include "llmc/fused_classifier.cuh"
 // defines: adamw_kernel3
@@ -319,7 +321,6 @@ typedef struct {
     int use_rmsnorm; // use RMSNorm instead of LayerNorm? 0|1
     int use_rope; // use RoPE instead of absolute wpe? 0|1
     float rope_theta; // RoPE base theta
-    int use_rmsnorm; // use RMSNorm instead of LayerNorm? 0|1
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
