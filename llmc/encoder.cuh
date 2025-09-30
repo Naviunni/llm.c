@@ -165,6 +165,34 @@ void encoder_forward(floatX* out,
     cudaCheck(cudaGetLastError());
 }
 
+__global__ void encoder_forward_tokonly_kernel(floatX* out,
+                                               const int* inp, const floatX* wte,
+                                               int B, int T, int C) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    int N = B * T * C;
+    if (idx >= N) { return; }
+    int bt = idx / C;
+    int b = bt / T;
+    int t = bt % T;
+    int c = idx % C;
+    int ix = inp[b * T + t];
+    floatX* out_btc = out + b * T * C + t * C + c;
+    const floatX* wte_ix = wte + ix * C + c;
+    x128 wte128 = load128cs(wte_ix);
+    store128(out_btc, wte128);
+}
+
+void encoder_forward_tokonly(floatX* out,
+                             const int* inp, const floatX* wte,
+                             int B, int T, int C, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    const int block_size = 256;
+    const int N = B * T * C;
+    const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
+    encoder_forward_tokonly_kernel<<<grid_size, block_size, 0, stream>>>(out, inp, wte, B, T, C);
+    cudaCheck(cudaGetLastError());
+}
+
 // Fully deterministic (see comments in wte_backward_kernel and wpe_backward_kernel for more details)
 void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
                       int* workload_indices, int4* bucket_info,    // cpu scratch buffers
@@ -230,5 +258,53 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
     // Launch wte kernel
     // todo - profile block sizes on more content (depends on number of buckets and on GPU?)
     wte_backward_kernel<256><<<num_buckets, 256, 0, stream>>>(dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C);
+    cudaCheck(cudaGetLastError());
+}
+
+// Only token embeddings backward (no position embedding grads)
+void encoder_backward_tokonly(floatX* dwte, floatX* scratch,
+                              int* workload_indices, int4* bucket_info,
+                              const floatX* dout, const int* inp, const int* inputs_cpu,
+                              int B, int T, int C, unsigned int seed, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    // check the GPU scratch buffer is large enough to hold the bucket info and workload indices
+    int num_c_groups = CEIL_DIV(C, x128::size * WARP_SIZE);
+    assert(B*T*num_c_groups * (sizeof(int4)+sizeof(int)) <= B*T*3*C * sizeof(floatX));
+
+    // Step 1: Sort inputs into buckets (same as encoder_backward)
+    int total_items = 0;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> buckets;
+    for (uint64_t bt = 0; bt < (uint64_t)B * T; bt++) {
+        for (uint64_t c_group = 0; c_group < (uint64_t)num_c_groups; c_group++) {
+            uint64_t data = bt + (c_group<<32ULL) + ((uint64_t)inputs_cpu[bt]<<42ULL);
+            buckets[c_group + (uint64_t)num_c_groups * inputs_cpu[bt]].push_back(data);
+            total_items++;
+        }
+    }
+
+    std::vector<std::pair<uint64_t, std::vector<uint64_t>>> sortedBuckets(buckets.begin(), buckets.end());
+    std::sort(sortedBuckets.begin(), sortedBuckets.end(),
+              [](const std::pair<uint64_t, std::vector<uint64_t>>& a, const std::pair<uint64_t, std::vector<uint64_t>>& b) {
+                  return a.second.size() > b.second.size();
+              });
+
+    int num_buckets = buckets.size();
+    int bucket_index = 0;
+    int workload_index = 0;
+    for (const auto& bucket : sortedBuckets) {
+        bucket_info[bucket_index].x = workload_index;
+        bucket_info[bucket_index].y = bucket.second.size();
+        bucket_info[bucket_index].z = (bucket.second[0] >> 42ULL) & ((1ULL<<20ULL)-1);
+        bucket_info[bucket_index].w = (bucket.second[0] >> 32ULL) & ((1ULL<<10ULL)-1);
+        for (uint64_t idx : bucket.second) {
+            workload_indices[workload_index++] = (int)(idx & ((1ULL<<31ULL)-1ULL));
+        }
+        bucket_index++;
+    }
+
+    // Step 3: Launch deterministic wte backward only
+    const int block_size = 256;
+    int grid_size = num_buckets;
+    wte_backward_kernel<256><<<grid_size, block_size, 0, stream>>>(dwte, bucket_info, workload_indices, dout, inp, seed, B, T, C);
     cudaCheck(cudaGetLastError());
 }

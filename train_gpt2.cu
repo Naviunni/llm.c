@@ -319,6 +319,10 @@ typedef struct {
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+    // feature toggles
+    int use_rope;      // 0|1
+    float rope_theta;  // RoPE base
+    int use_rmsnorm;   // 0|1
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -348,6 +352,10 @@ void gpt2_init_common(GPT2 *model) {
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    // feature toggles defaults
+    model->use_rope = 0;
+    model->rope_theta = 10000.0f;
+    model->use_rmsnorm = 0;
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -677,10 +685,18 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    if (model->use_rope) {
+        encoder_forward_tokonly(acts.encoded, model->inputs, params.wte, B, T, C, main_stream);
+    } else {
+        encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // token+pos
+    }
 
-    // first layernorm isn't fused
-    layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
+    // first normalization (isn't fused)
+    if (model->use_rmsnorm) {
+        rmsnorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_rstd, acts.encoded, params.ln1w, B, T, C, main_stream);
+    } else {
+        layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
+    }
 
     for (int l = 0; l < L; l++) {
         NvtxRange layer_range("Layer", l);
@@ -718,6 +734,7 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        if (model->use_rope) { apply_rope_qkvr_inplace(l_qkvr, B, T, C, NH, model->rope_theta, main_stream); }
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
@@ -727,11 +744,15 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream, model->use_rope, model->rope_theta);
         #endif
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
-        fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
+        if (model->use_rmsnorm) {
+            fused_residual_rmsnorm_forward(l_residual2, l_ln2, l_ln2_rstd, residual, scratch, l_ln2w, B*T, C, main_stream);
+        } else {
+            fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
+        }
         matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
         // OK, fusion across blocks.
@@ -741,12 +762,21 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             float* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
             const floatX* l_ln1b = params.ln1b + (l + 1) * C;
-            fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
-                                    B * T, C, main_stream);
+            if (model->use_rmsnorm) {
+                fused_residual_rmsnorm_forward(l_residual3, l_ln1, l_ln1_rstd, l_residual2, scratch, l_ln1w, B * T, C, main_stream);
+            } else {
+                fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
+                                        B * T, C, main_stream);
+            }
         } else {
-            fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
-                                    params.lnfw, params.lnfb,
-                                    B * T, C, main_stream);
+            if (model->use_rmsnorm) {
+                fused_residual_rmsnorm_forward(l_residual3, acts.lnf, acts.lnf_rstd, l_residual2, scratch,
+                                               params.lnfw, B * T, C, main_stream);
+            } else {
+                fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
+                                        params.lnfw, params.lnfb,
+                                        B * T, C, main_stream);
+            }
         }
     }
 
@@ -837,9 +867,14 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     // next: backward the classifier matmul
     matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
-    // backward the final layernorm
+    // backward the final normalization
     floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
-    layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
+    if (model->use_rmsnorm) {
+        rmsnorm_backward(dresidual, grads.lnfw, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_rstd, B, T, C, main_stream);
+        rmsnorm_dweight_backward(grads.lnfw, model->acts.scratch_bt4c, residual, acts.lnf_rstd, B, T, C, main_stream);
+    } else {
+        layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
+    }
 
     // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
     // scratch for backward computations
@@ -899,31 +934,50 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         }
         matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
         if(model->recompute >= 2) {
-            // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
-            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+            // recompute normalization if needed
+            if (model->use_rmsnorm) {
+                rmsnorm_forward(l_ln2, l_ln2_rstd, l_residual2, l_ln2w, B, T, C, main_stream);
+            } else {
+                layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+            }
         }
         matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
-        // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
-        layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
+        // normalization backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
+        if (model->use_rmsnorm) {
+            rmsnorm_backward(dresidual, dl_ln2w, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_rstd, B, T, C, main_stream);
+            rmsnorm_dweight_backward(dl_ln2w, dl_btc, l_residual2, l_ln2_rstd, B, T, C, main_stream);
+        } else {
+            layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
+        }
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
 
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, main_stream);
+        if (model->use_rope) { apply_rope_qkvr_backward_inplace(dl_bt4c, B, T, C, NH, model->rope_theta, main_stream); }
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
-        attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
+        attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream, model->use_rope, model->rope_theta);
         #endif
         if(model->recompute >= 2) {
-            layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
+            if (model->use_rmsnorm) {
+                rmsnorm_forward(l_ln1, l_ln1_rstd, residual, l_ln1w, B, T, C, main_stream);
+            } else {
+                layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
+            }
         }
         // QKV parameter gradients
         matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
-        // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
-        layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
+        // normalization backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
+        if (model->use_rmsnorm) {
+            rmsnorm_backward(dresidual, dl_ln1w, scratchF, dl_btc, residual, l_ln1w, l_ln1_rstd, B, T, C, main_stream);
+            rmsnorm_dweight_backward(dl_ln1w, dl_btc, residual, l_ln1_rstd, B, T, C, main_stream);
+        } else {
+            layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
+        }
 
         // Accumulate gradients from this layer in a background stream.
         if(last_step) {
@@ -946,8 +1000,13 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
         }
     }
-    encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
-                     dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
+    if (model->use_rope) {
+        encoder_backward_tokonly(grads.wte, scratchX, model->workload_indices, model->bucket_info,
+                                 dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
+    } else {
+        encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
+                         dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
+    }
 
     // Aggregate all gradients that are not part of the transformer blocks
     if(last_step) {
@@ -1401,6 +1460,10 @@ void error_usage() {
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
     fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 2 for >=SM90, 0 for older GPUs)\n");
+    // architecture tweaks
+    fprintf(stderr, "  -nr <int>   use RMSNorm instead of LayerNorm? 0/1 (default=0)\n");
+    fprintf(stderr, "  -rp <int>   use RoPE (rotary pos embedding), drop absolute WPE? 0/1 (default=0)\n");
+    fprintf(stderr, "  -rt <float> RoPE base theta (default=10000.0)\n");
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
@@ -1447,6 +1510,9 @@ int main(int argc, char *argv[]) {
     int use_master_weights = 1;
     int gelu_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
+    int use_rmsnorm = 0;
+    int use_rope = 0;
+    float rope_theta = 10000.0f;
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
     // multi-node settings
@@ -1485,7 +1551,10 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'r') { use_rmsnorm = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r' && argv[i][2] == 'p') { use_rope = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r' && argv[i][2] == 't') { rope_theta = atof(argv[i+1]); }
+        else if (argv[i][1] == 'r' && argv[i][2] == '\0') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
@@ -1547,6 +1616,9 @@ int main(int argc, char *argv[]) {
     printf0("| use_master_weights    | %-50s |\n", use_master_weights ? "enabled" : "disabled");
     printf0("| gelu_fusion           | %-50d |\n", gelu_fusion);
     printf0("| recompute             | %-50d |\n", recompute);
+    printf0("| use_rmsnorm           | %-50d |\n", use_rmsnorm);
+    printf0("| use_rope              | %-50d |\n", use_rope);
+    printf0("| rope_theta            | %-50.1f |\n", rope_theta);
     printf0("+-----------------------+----------------------------------------------------+\n");
     const char* precision_str = (PRECISION_MODE == PRECISION_FP32)
                               ? (cublas_compute == CUBLAS_COMPUTE_32F_FAST_TF32 ? "TF32" : "FP32")
@@ -1588,6 +1660,9 @@ int main(int argc, char *argv[]) {
     model.use_master_weights = use_master_weights;
     model.gelu_fusion = gelu_fusion;
     model.recompute = recompute;
+    model.use_rmsnorm = use_rmsnorm;
+    model.use_rope = use_rope;
+    model.rope_theta = rope_theta;
     printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);

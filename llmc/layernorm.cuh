@@ -503,3 +503,143 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
+
+// ----------------------------------------------------------------------------
+// RMSNorm variants (no mean subtraction, no bias)
+
+__global__ void rmsnorm_forward_kernel(floatX* __restrict__ out, float* __restrict__ rstd,
+                                       const floatX* __restrict__ inp, const floatX* __restrict__ weight,
+                                       int N, int C) {
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
+    int idx = blockIdx.x * num_warps + warp_id;
+    if (idx >= N) return;
+    const floatX* x = inp + idx * C;
+    // compute mean of squares
+    float sumsq = 0.0f;
+    for (int i = lane_id; i < C; i += WARP_SIZE) {
+        float xi = (float)x[i];
+        sumsq += xi * xi;
+    }
+    sumsq = warpReduceSum(sumsq);
+    float s = rsqrtf(sumsq / C + 1e-5f);
+    if (lane_id == 0 && rstd != nullptr) { __stcs(rstd + idx, s); }
+    floatX* o = out + idx * C;
+    for (int c = lane_id; c < C; c += WARP_SIZE) {
+        float xi = (float)__ldcs(x + c);
+        __stcs(o + c, (floatX)(s * xi * (float)weight[c]));
+    }
+}
+
+__global__ void fused_residual_rmsnorm_forward_kernel(floatX* residual, floatX* normed, float* rstd,
+                                                      const floatX* inp1, const floatX* inp2,
+                                                      const floatX* weight,
+                                                      int N, int C) {
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
+    int idx = blockIdx.x * num_warps + warp_id;
+    if (idx >= N) return;
+    residual += idx * C; normed += idx * C; inp1 += idx * C; inp2 += idx * C;
+    float sumsq = 0.0f;
+    for (int c = lane_id; c < C; c += WARP_SIZE) {
+        float acc = (float)__ldcs(inp1 + c) + (float)__ldcs(inp2 + c);
+        __stcs(residual + c, (floatX)acc);
+        sumsq += acc * acc;
+    }
+    sumsq = warpReduceSum(sumsq);
+    float s = rsqrtf(sumsq / C + 1e-5f);
+    if (lane_id == 0 && rstd != nullptr) { __stcs(rstd + idx, s); }
+    for (int c = lane_id; c < C; c += WARP_SIZE) {
+        float res = (float)__ldcs(residual + c);
+        __stcs(normed + c, (floatX)(s * res * (float)weight[c]));
+    }
+}
+
+__global__ void rmsnorm_backward_kernel(floatX* dinp, const floatX* dout,
+                                        const floatX* inp, const floatX* weight,
+                                        const float* rstd, int N, int C) {
+    // Each block computes one row using warps
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = blockDim.x / WARP_SIZE;
+    int idx = blockIdx.x * num_warps + warp_id;
+    if (idx >= N) return;
+    const float s = rstd ? rstd[idx] : 0.0f;
+    const floatX* x = inp + idx * C;
+    const floatX* g = dout + idx * C;
+    floatX* dx = dinp + idx * C;
+    // compute t = sum_j (g_j * w_j * x_j)
+    float t = 0.0f;
+    for (int c = lane_id; c < C; c += WARP_SIZE) {
+        t += (float)g[c] * (float)weight[c] * (float)x[c];
+    }
+    t = warpReduceSum(t);
+    // compute dx
+    float s3_over_C = (s * s * s) / (float)C;
+    for (int c = lane_id; c < C; c += WARP_SIZE) {
+        float term1 = s * (float)weight[c] * (float)g[c];
+        float term2 = s3_over_C * (float)x[c] * t;
+        float val = term1 - term2;
+        __stcs(dx + c, (floatX)val);
+    }
+}
+
+void rmsnorm_forward(floatX* out, float* rstd,
+                     floatX* inp, const floatX* weight,
+                     int B, int T, int C, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    const int block_size = 256;
+    int block_y = block_size / WARP_SIZE;
+    const int N = B * T;
+    const int grid_size = CEIL_DIV(N, block_y);
+    rmsnorm_forward_kernel<<<grid_size, dim3(WARP_SIZE, block_y), 0, stream>>>(out, rstd, inp, weight, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
+void fused_residual_rmsnorm_forward(floatX* residual, floatX* normed, float* rstd,
+                                    const floatX* inp1, const floatX* inp2,
+                                    const floatX* weight,
+                                    int N, int C, cudaStream_t stream) {
+    const int block_size = 256;
+    int block_y = block_size / WARP_SIZE;
+    const int grid_size = CEIL_DIV(N, block_y);
+    fused_residual_rmsnorm_forward_kernel<<<grid_size, dim3(WARP_SIZE, block_y), 0, stream>>>(residual, normed, rstd, inp1, inp2, weight, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
+void rmsnorm_backward(floatX* dinp, floatX* dweight_unused, float* scratch_unused,
+                      const floatX* dout, const floatX* inp, const floatX* weight, const float* rstd,
+                      int B, int T, int C, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    const int block_size = 256;
+    int block_y = block_size / WARP_SIZE;
+    const int N = B * T;
+    const int grid_size = CEIL_DIV(N, block_y);
+    rmsnorm_backward_kernel<<<grid_size, dim3(WARP_SIZE, block_y), 0, stream>>>(dinp, dout, inp, weight, rstd, N, C);
+    cudaCheck(cudaGetLastError());
+}
+
+__global__ void rmsnorm_dweight_kernel(floatX* dweight, const floatX* dout, const floatX* inp, const float* rstd,
+                                       int N, int C) {
+    int c = blockIdx.x; // one thread per channel
+    // reduce over N rows
+    float acc = 0.0f;
+    for (int n = 0; n < N; ++n) {
+        float s = rstd[n];
+        acc += (float)dout[n * C + c] * s * (float)inp[n * C + c];
+    }
+    // read-modify-write in floatX format (no races because single thread per c)
+    float prev = (float)dweight[c];
+    dweight[c] = (floatX)(prev + acc);
+}
+
+void rmsnorm_dweight_backward(floatX* dweight, const floatX* dout, const floatX* inp, const float* rstd,
+                              int B, int T, int C, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    int N = B * T;
+    int grid = C;
+    rmsnorm_dweight_kernel<<<grid, 1, 0, stream>>>(dweight, dout, inp, rstd, N, C);
+    cudaCheck(cudaGetLastError());
+}

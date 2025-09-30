@@ -192,9 +192,144 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
 // ----------------------------------------------------------------------------
 // kernel launchers
 
+__global__ void rope_apply_qk_kernel(floatX* q, floatX* k, int B, int T, int NH, int HS, float theta) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = HS / 2;
+    int total = B * NH * T * half;
+    if (idx >= total) return;
+    int d = idx % half; int tmp = idx / half;
+    int t = tmp % T; tmp /= T; int nh = tmp % NH; int b = tmp / NH;
+    floatX* q_ptr = q + (((b * NH + nh) * T + t) * HS);
+    floatX* k_ptr = k + (((b * NH + nh) * T + t) * HS);
+    float inv_freq = powf(theta, -(float)d / (float)half);
+    float angle = (float)t * inv_freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+    int even = 2*d;
+    int odd  = 2*d + 1;
+    float q_e = (float)q_ptr[even];
+    float q_o = (float)q_ptr[odd];
+    float k_e = (float)k_ptr[even];
+    float k_o = (float)k_ptr[odd];
+    q_ptr[even] = (floatX)(q_e * c - q_o * s);
+    q_ptr[odd]  = (floatX)(q_e * s + q_o * c);
+    k_ptr[even] = (floatX)(k_e * c - k_o * s);
+    k_ptr[odd]  = (floatX)(k_e * s + k_o * c);
+}
+
+__global__ void rope_apply_qk_backward_kernel(floatX* dq, floatX* dk, int B, int T, int NH, int HS, float theta) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = HS / 2;
+    int total = B * NH * T * half;
+    if (idx >= total) return;
+    int d = idx % half; int tmp = idx / half;
+    int t = tmp % T; tmp /= T; int nh = tmp % NH; int b = tmp / NH;
+    floatX* dq_ptr = dq + (((b * NH + nh) * T + t) * HS);
+    floatX* dk_ptr = dk + (((b * NH + nh) * T + t) * HS);
+    float inv_freq = powf(theta, -(float)d / (float)half);
+    float angle = (float)t * inv_freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+    int even = 2*d;
+    int odd  = 2*d + 1;
+    float dqe = (float)dq_ptr[even];
+    float dqo = (float)dq_ptr[odd];
+    float dke = (float)dk_ptr[even];
+    float dko = (float)dk_ptr[odd];
+    dq_ptr[even] = (floatX)(dqe * c + dqo * s);
+    dq_ptr[odd]  = (floatX)(-dqe * s + dqo * c);
+    dk_ptr[even] = (floatX)(dke * c + dko * s);
+    dk_ptr[odd]  = (floatX)(-dke * s + dko * c);
+}
+
+inline void apply_rope_qk(floatX* q, floatX* k, int B, int T, int C, int NH, float theta, cudaStream_t stream) {
+    int HS = C / NH;
+    if (HS % 2 != 0) { fprintf(stderr, "RoPE requires even head size.\n"); exit(EXIT_FAILURE);} 
+    int total = B * NH * T * (HS/2);
+    int block = 256;
+    int grid = CEIL_DIV(total, block);
+    rope_apply_qk_kernel<<<grid, block, 0, stream>>>(q, k, B, T, NH, HS, theta);
+    cudaCheck(cudaGetLastError());
+}
+
+inline void apply_rope_qk_backward(floatX* dq, floatX* dk, int B, int T, int C, int NH, float theta, cudaStream_t stream) {
+    int HS = C / NH;
+    if (HS % 2 != 0) { fprintf(stderr, "RoPE requires even head size.\n"); exit(EXIT_FAILURE);} 
+    int total = B * NH * T * (HS/2);
+    int block = 256;
+    int grid = CEIL_DIV(total, block);
+    rope_apply_qk_backward_kernel<<<grid, block, 0, stream>>>(dq, dk, B, T, NH, HS, theta);
+    cudaCheck(cudaGetLastError());
+}
+
+__global__ void rope_apply_qkvr_inplace_kernel(floatX* qkvr, int B, int T, int C, int NH, int HS, float theta) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = HS / 2;
+    int total = B * T * NH * half;
+    if (idx >= total) return;
+    int d = idx % half; int tmp = idx / half;
+    int nh = tmp % NH; tmp /= NH; int t = tmp % T; int b = tmp / T;
+    float inv_freq = powf(theta, -(float)d / (float)half);
+    float angle = (float)t * inv_freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+    int even = 2*d;
+    int odd  = 2*d + 1;
+    size_t base = ((size_t)b * T + t) * (size_t)(3 * C);
+    floatX* q = qkvr + base + 0 * C + nh * HS;
+    floatX* k = qkvr + base + 1 * C + nh * HS;
+    float q_e = (float)q[even]; float q_o = (float)q[odd];
+    float k_e = (float)k[even]; float k_o = (float)k[odd];
+    q[even] = (floatX)(q_e * c - q_o * s);
+    q[odd]  = (floatX)(q_e * s + q_o * c);
+    k[even] = (floatX)(k_e * c - k_o * s);
+    k[odd]  = (floatX)(k_e * s + k_o * c);
+}
+
+__global__ void rope_apply_qkvr_backward_inplace_kernel(floatX* dqkvr, int B, int T, int C, int NH, int HS, float theta) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = HS / 2;
+    int total = B * T * NH * half;
+    if (idx >= total) return;
+    int d = idx % half; int tmp = idx / half;
+    int nh = tmp % NH; tmp /= NH; int t = tmp % T; int b = tmp / T;
+    float inv_freq = powf(theta, -(float)d / (float)half);
+    float angle = (float)t * inv_freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+    int even = 2*d;
+    int odd  = 2*d + 1;
+    size_t base = ((size_t)b * T + t) * (size_t)(3 * C);
+    floatX* dq = dqkvr + base + 0 * C + nh * HS;
+    floatX* dk = dqkvr + base + 1 * C + nh * HS;
+    float dqe = (float)dq[even]; float dqo = (float)dq[odd];
+    float dke = (float)dk[even]; float dko = (float)dk[odd];
+    dq[even] = (floatX)(dqe * c + dqo * s);
+    dq[odd]  = (floatX)(-dqe * s + dqo * c);
+    dk[even] = (floatX)(dke * c + dko * s);
+    dk[odd]  = (floatX)(-dke * s + dko * c);
+}
+
+inline void apply_rope_qkvr_inplace(floatX* qkvr, int B, int T, int C, int NH, float theta, cudaStream_t stream) {
+    int HS = C / NH; if (HS % 2 != 0) { fprintf(stderr, "RoPE requires even head size.\n"); exit(EXIT_FAILURE);} 
+    int total = B * T * NH * (HS/2);
+    int block = 256; int grid = CEIL_DIV(total, block);
+    rope_apply_qkvr_inplace_kernel<<<grid, block, 0, stream>>>(qkvr, B, T, C, NH, HS, theta);
+    cudaCheck(cudaGetLastError());
+}
+
+inline void apply_rope_qkvr_backward_inplace(floatX* dqkvr, int B, int T, int C, int NH, float theta, cudaStream_t stream) {
+    int HS = C / NH; if (HS % 2 != 0) { fprintf(stderr, "RoPE requires even head size.\n"); exit(EXIT_FAILURE);} 
+    int total = B * T * NH * (HS/2);
+    int block = 256; int grid = CEIL_DIV(total, block);
+    rope_apply_qkvr_backward_inplace_kernel<<<grid, block, 0, stream>>>(dqkvr, B, T, C, NH, HS, theta);
+    cudaCheck(cudaGetLastError());
+}
+
 void attention_forward(floatX* out, floatX* qkvr, floatX* att,
                        floatX* inp,
-                       int B, int T, int C, int NH, cudaStream_t stream) {
+                       int B, int T, int C, int NH, cudaStream_t stream,
+                       bool use_rope=false, float rope_theta=10000.0f) {
     NVTX_RANGE_FN();
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
@@ -213,6 +348,7 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
+    if (use_rope) { apply_rope_qk(q, k, B, T, C, NH, rope_theta, stream); }
 
     floatX* preatt = inp; // reuse inp as scratch buffer
     matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
@@ -239,7 +375,8 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
                         const floatX* dout,
                         const floatX* qkvr, const floatX* att,
-                        int B, int T, int C, int NH, cudaStream_t stream) {
+                        int B, int T, int C, int NH, cudaStream_t stream,
+                        bool use_rope=false, float rope_theta=10000.0f) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int HS = C / NH; // head size
@@ -269,6 +406,8 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     matmul_cublaslt(dq, k, dpreatt, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
     // backward into k
     matmul_cublaslt(dk, q, dpreatt, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
+    // undo RoPE rotation for dq, dk before permuting back
+    if (use_rope) { apply_rope_qk_backward(dq, dk, B, T, C, NH, rope_theta, stream); }
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);

@@ -45,6 +45,18 @@ class NewGELU(nn.Module):
 # using a global to toggle flash-attention
 FLASH = 0
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (no mean subtraction, no bias)."""
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        x_norm = x * rms
+        return x_norm * self.weight
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -58,9 +70,35 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.use_rope = getattr(config, 'use_rope', False)
+        self.rope_theta = getattr(config, 'rope_theta', 10000.0)
         # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
+
+    def _apply_rotary(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        # x: (B, nh, T, hs); cos/sin: (T, hs/2)
+        hs = x.size(-1)
+        x_even = x[..., 0:hs:2]
+        x_odd = x[..., 1:hs:2]
+        cos = cos.view(1, 1, cos.size(0), cos.size(1))
+        sin = sin.view(1, 1, sin.size(0), sin.size(1))
+        x_rot_even = x_even * cos - x_odd * sin
+        x_rot_odd = x_even * sin + x_odd * cos
+        out = torch.empty_like(x)
+        out[..., 0:hs:2] = x_rot_even
+        out[..., 1:hs:2] = x_rot_odd
+        return out
+
+    def _rope_cache(self, T: int, hs: int, device, dtype):
+        theta = self.rope_theta
+        half = hs // 2
+        inv_freq = 1.0 / (theta ** (torch.arange(0, half, device=device, dtype=torch.float32) / half))
+        t = torch.arange(T, device=device, dtype=torch.float32)
+        freqs = torch.einsum('t,f->tf', t, inv_freq)  # (T, half)
+        cos = torch.cos(freqs).to(dtype)
+        sin = torch.sin(freqs).to(dtype)
+        return cos, sin
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -70,6 +108,10 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        if self.use_rope:
+            cos, sin = self._rope_cache(T, C // self.n_head, x.device, q.dtype)
+            q = self._apply_rotary(q, cos, sin)
+            k = self._apply_rotary(k, cos, sin)
         if FLASH:
             # flashattention
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -104,9 +146,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.ln_1 = RMSNorm(config.n_embd) if getattr(config, 'norm_type', 'layernorm') == 'rmsnorm' else nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.ln_2 = RMSNorm(config.n_embd) if getattr(config, 'norm_type', 'layernorm') == 'rmsnorm' else nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -124,6 +166,10 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    # extensions/toggles
+    norm_type: str = 'layernorm'  # 'layernorm' | 'rmsnorm'
+    use_rope: bool = False
+    rope_theta: float = 10000.0
 
 class GPT(nn.Module):
 
@@ -133,9 +179,9 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wpe = None if getattr(config, 'use_rope', False) else nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
+            ln_f = RMSNorm(config.n_embd) if getattr(config, 'norm_type', 'layernorm') == 'rmsnorm' else nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
@@ -167,8 +213,11 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = tok_emb + pos_emb
+        if self.transformer.wpe is None:
+            x = tok_emb
+        else:
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            x = tok_emb + pos_emb
 
         for block in self.transformer.h:
             x = block(x)
@@ -207,6 +256,9 @@ class GPT(nn.Module):
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
+        # pretrained GPT-2 uses LayerNorm + absolute pos embeddings
+        config.norm_type = 'layernorm'
+        config.use_rope = False
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
@@ -397,7 +449,10 @@ def write_tensors(model_tensors, L, file, dtype):
     assert dtype in {"float32", "bfloat16"}
     write_fun = write_fp32 if dtype == "float32" else write_bf16
     write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
-    write_fun(model_tensors["transformer.wpe.weight"], file) # (T, C)
+    if model_tensors.get("transformer.wpe.weight", None) is not None:
+        write_fun(model_tensors["transformer.wpe.weight"], file) # (T, C)
+    else:
+        raise NotImplementedError("Export not implemented for RoPE (no absolute wpe). Set --write_tensors=0.")
     for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
     for i in range(L): # (L, C)
@@ -423,7 +478,10 @@ def write_tensors(model_tensors, L, file, dtype):
     for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
     write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
-    write_fun(model_tensors["transformer.ln_f.bias"], file) # (C, )
+    if "transformer.ln_f.bias" in model_tensors:
+        write_fun(model_tensors["transformer.ln_f.bias"], file) # (C, )
+    else:
+        raise NotImplementedError("Export not implemented for RMSNorm (no ln_f.bias). Set --write_tensors=0.")
 
 @torch.no_grad()
 def pad_vocab(tensor, multiple=128, value=0):
@@ -546,6 +604,9 @@ if __name__ == "__main__":
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
+    parser.add_argument("--norm", type=str, default="layernorm", choices=["layernorm","rmsnorm"], help="normalization type")
+    parser.add_argument("--rope", type=int, default=0, help="use rotary positional embeddings (drop absolute wpe)")
+    parser.add_argument("--rope_theta", type=float, default=10000.0, help="RoPE base theta")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -657,10 +718,17 @@ if __name__ == "__main__":
             "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
             "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
         }[args.model]
+        # apply overrides
+        model_config.norm_type = args.norm
+        model_config.use_rope = bool(args.rope)
+        model_config.rope_theta = args.rope_theta
         model = GPT(model_config)
     else:
         # load the GPT-2 model weights
         model = GPT.from_pretrained(args.model)
+        # warn if user requested features incompatible with pretrained weights
+        if args.norm == 'rmsnorm' or args.rope:
+            print0("Warning: --norm/--rope flags are ignored when loading pretrained GPT-2; using LayerNorm + abs WPE.")
     model.train()
     model.to(device)
     if args.compile:
@@ -687,15 +755,17 @@ if __name__ == "__main__":
         x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
         loss.backward()
-        # save model params, in both float32 and bfloat16
-        model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
-        model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
-        model_size_str = model_to_size[args.model] # e.g. "124M", or "d12"
-        write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
-        write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
-        # save x, y, logits, loss, and parameter gradients, for debugging C
-        # always store these in fp32 to have an accurate reference (?)
-        write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
+        # save model params/state unless RoPE/RMSNorm are enabled (C path expects LN+abs WPE)
+        if args.rope or args.norm == 'rmsnorm':
+            print0("Skipping tensor export (write_tensors=1) because RoPE/RMSNorm are enabled and C/CUDA path expects LN+abs WPE. Set --write_tensors=0 to suppress this message.")
+        else:
+            model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+            model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
+            model_size_str = model_to_size[args.model] # e.g. "124M", or "d12"
+            write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
+            write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
+            # save x, y, logits, loss, and parameter gradients, for debugging C in fp32
+            write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
         # reset the train_loader for the optimization below
         train_loader.reset()
 
