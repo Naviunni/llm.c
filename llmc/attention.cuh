@@ -10,6 +10,7 @@ Attention, as a fallback when we do not use the Flash Attention from cuDNN
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
+
 // inputs floatX, outputs FP32 (for current FP32-only activation path for this WIP)
 __global__ void permute_kernel(floatX* q, floatX* k, floatX* v,
                                const floatX* inp,
@@ -274,3 +275,5 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);
     cudaCheck(cudaGetLastError());
 }
+
+// (RoPE kernels and launchers moved to llmc/rope.cuh)
