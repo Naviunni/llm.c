@@ -302,9 +302,15 @@ void encoder_backward_tokonly(floatX* dwte, floatX* scratch,
         bucket_index++;
     }
 
-    // Step 3: Launch deterministic wte backward only
+    // Step 3: Copy CPU bucket metadata to device scratch and launch deterministic wte backward only
+    int num_c_groups = CEIL_DIV(C, x128::size * WARP_SIZE);
+    int4* d_bucket_info = (int4*)scratch;
+    int*  d_workload_indices = (int*)(scratch + B*T*num_c_groups * sizeof(int4));
+    cudaCheck(cudaMemcpyAsync(d_bucket_info, bucket_info, num_buckets * sizeof(int4), cudaMemcpyHostToDevice, stream));
+    cudaCheck(cudaMemcpyAsync(d_workload_indices, workload_indices, total_items * sizeof(int), cudaMemcpyHostToDevice, stream));
+
     const int block_size = 256;
     int grid_size = num_buckets;
-    wte_backward_kernel<256><<<grid_size, block_size, 0, stream>>>(dwte, bucket_info, workload_indices, dout, inp, seed, B, T, C);
+    wte_backward_kernel<256><<<grid_size, block_size, 0, stream>>>(dwte, d_bucket_info, d_workload_indices, dout, inp, seed, B, T, C);
     cudaCheck(cudaGetLastError());
 }
