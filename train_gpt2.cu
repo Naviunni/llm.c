@@ -317,6 +317,9 @@ typedef struct {
     int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
     int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
     int use_rmsnorm; // use RMSNorm instead of LayerNorm? 0|1
+    int use_rope; // use RoPE instead of absolute wpe? 0|1
+    float rope_theta; // RoPE base theta
+    int use_rmsnorm; // use RMSNorm instead of LayerNorm? 0|1
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
@@ -350,6 +353,8 @@ void gpt2_init_common(GPT2 *model) {
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
     model->use_rmsnorm = 0; // default: use LayerNorm
+    model->use_rope = 0; // default: use absolute position encodings
+    model->rope_theta = 10000.0f; // default RoPE base
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -679,7 +684,11 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
     // forward pass
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
+    if (model->use_rope) {
+        encoder_forward_wte_only(acts.encoded, model->inputs, params.wte, B, T, C, main_stream);
+    } else {
+        encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream);
+    }
 
     // first normalization (LayerNorm or RMSNorm)
     if (model->use_rmsnorm) {
@@ -724,6 +733,9 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        if (model->use_rope) {
+            apply_rope_inplace_fused_qk(l_qkvr, B, T, C, NH, model->rope_theta, main_stream);
+        }
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
@@ -733,6 +745,9 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
         // these are only needed as scratchpads for the forward pass, but
         // need not be stored for backward
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+        if (model->use_rope) {
+            apply_rope_inplace_fused_qk(scratch, B, T, C, NH, model->rope_theta, main_stream);
+        }
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
 
@@ -937,12 +952,18 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         #ifdef ENABLE_CUDNN
         float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float*)l_att, B, T, NH, C, main_stream);
+        if (model->use_rope) {
+            apply_rope_inplace_fused_qk_backward(dl_bt4c, B, T, C, NH, model->rope_theta, main_stream);
+        }
         #else
         floatX* l_att = acts.att + l * B * NH * T * T;
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
+        if (model->use_rope) {
+            apply_rope_inplace_fused_qk_backward(dl_bt4c, B, T, C, NH, model->rope_theta, main_stream);
+        }
         #endif
         if(model->recompute >= 2) {
             if (model->use_rmsnorm) {
@@ -983,6 +1004,10 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     }
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
                      dresidual, model->inputs, inputs, B, T, C, random_u32(&model->rng_state), main_stream);
+    if (model->use_rope) {
+        // wpe is unused under RoPE; ensure its gradient is zero
+        cudaCheck(cudaMemset(grads.wpe, 0, model->param_elements[1] * sizeof(floatX)));
+    }
 
     // Aggregate all gradients that are not part of the transformer blocks
     if(last_step) {
@@ -1113,6 +1138,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         // - the token embeddings are weight shared and participate in the final projection to logits
         // - the position embeddings actively participate at every forward/backward pass
         float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+        if (model->use_rope && i == 1) { wd = 0.0f; } // do not decay wpe when unused under RoPE
         floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
         floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
 
@@ -1437,6 +1463,8 @@ void error_usage() {
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
     fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 2 for >=SM90, 0 for older GPUs)\n");
     fprintf(stderr, "  -R <int>    use RMSNorm instead of LayerNorm? 0/1 (default = 0)\n");
+    fprintf(stderr, "  -P <int>    use RoPE instead of absolute pos emb? 0/1 (default = 0)\n");
+    fprintf(stderr, "  -RT <float> RoPE theta/base (default = 10000.0)\n");
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
@@ -1484,6 +1512,8 @@ int main(int argc, char *argv[]) {
     int gelu_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int use_rmsnorm = 0; // 0 = LayerNorm (default), 1 = RMSNorm
+    int use_rope = 0; // 0 = absolute wpe (default), 1 = RoPE
+    float rope_theta = 10000.0f;
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
     // multi-node settings
@@ -1522,6 +1552,8 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
         else if (argv[i][1] == 'R') { use_rmsnorm = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'P') { use_rope = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'R' && argv[i][2] == 'T') { rope_theta = atof(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
         else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
@@ -1627,6 +1659,8 @@ int main(int argc, char *argv[]) {
     model.gelu_fusion = gelu_fusion;
     model.recompute = recompute;
     model.use_rmsnorm = use_rmsnorm;
+    model.use_rope = use_rope;
+    model.rope_theta = rope_theta;
     printf0("| weight init method    | %-50s |\n", resuming == 1 ? "intermediate checkpoint" : load_filename);
     printf0("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf0("| vocab_size V          | %-50d |\n", model.config.vocab_size);
@@ -1636,6 +1670,10 @@ int main(int argc, char *argv[]) {
     printf0("| channels C            | %-50d |\n", model.config.channels);
     printf0("| num_parameters        | %-50zu |\n", model.num_parameters);
     printf0("| normalization         | %-50s |\n", model.use_rmsnorm ? "RMSNorm" : "LayerNorm");
+    printf0("| position encodings    | %-50s |\n", model.use_rope ? "RoPE" : "Absolute (wpe)");
+    if (model.use_rope) {
+        printf0("| rope_theta            | %-50.1f |\n", model.rope_theta);
+    }
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val

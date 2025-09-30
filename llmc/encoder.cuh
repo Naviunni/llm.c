@@ -43,6 +43,27 @@ __global__ void encoder_forward_kernel3(floatX* out,
     store128(out_btc, packed_out);
 }
 
+// WTE-only forward (no position encodings); out[b,t,:] = wte[x[b,t], :]
+__global__ void encoder_forward_wte_only_kernel(floatX* out,
+                                                const int* inp, const floatX* wte,
+                                                int B, int T, int C) {
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    int N = B * T * C;
+    if (idx >= N) { return; }
+
+    int bt = idx / C;
+    int b = bt / T;
+    int t = bt % T;
+    int c = idx % C;
+
+    int ix = inp[b * T + t];
+    floatX* out_btc = out + b * T * C + t * C + c;
+    const floatX* wte_ix = wte + ix * C + c;
+
+    x128 wte128 = load128cs(wte_ix);
+    store128(out_btc, wte128);
+}
+
 template <int BLOCK_SIZE=256>
 __global__ void wte_backward_kernel(floatX* dwte,
                                     const int4* bucket_info, const int* workload_indices, const floatX* dout, const int* inp,
@@ -162,6 +183,17 @@ void encoder_forward(floatX* out,
     const int N = B * T * C;
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
     encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C);
+    cudaCheck(cudaGetLastError());
+}
+
+void encoder_forward_wte_only(floatX* out,
+                              const int* inp, const floatX* wte,
+                              int B, int T, int C, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+    const int block_size = 256;
+    const int N = B * T * C;
+    const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
+    encoder_forward_wte_only_kernel<<<grid_size, block_size, 0, stream>>>(out, inp, wte, B, T, C);
     cudaCheck(cudaGetLastError());
 }
 
