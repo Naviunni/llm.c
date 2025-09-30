@@ -540,7 +540,7 @@ void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str) {
     config->num_layers = depth;
     config->channels = channels;
     config->num_heads = num_heads;
-    config->max_seq_len = 512;
+    config->max_seq_len = 1024;
 }
 
 void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
@@ -1491,7 +1491,7 @@ int main(int argc, char *argv[]) {
     int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
     int resume = 0; // resume the optimization, if one is found inside output_log_dir?
     int B = 4; // batch size
-    int T = 512; // sequence length max
+    int T = 1024; // sequence length max
     int total_batch_size = -1; // will be calculated down below later, if not provided
     float learning_rate = 3e-4f;
     int log_gpu_every = -1;
