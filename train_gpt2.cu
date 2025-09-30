@@ -960,7 +960,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         // we need B x T x (4)C buffers. l_atty and l_fch aren't needed anymore at this point, so reuse their memory
         floatX* buffer_a = l_atty;
         floatX* buffer_b = l_fch_pre_gelu;        // this is B x T x 4C, so even larger than what we need
-        attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream, model->use_rope, model->rope_theta);
+        attention_backward(dl_bt4c, buffer_b, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream, model->use_rope, model->rope_theta);
         #endif
         if(model->recompute >= 2) {
             if (model->use_rmsnorm) {

@@ -372,9 +372,9 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 
 // the sequence of transformations in this compound op is:
 // inp (B,T,3C) -> qkvr (B,T,3C) -> preatt (B,NH,T,T) -> att (B,NH,T,T) -> vaccum (B,T,C) -> out (B,T,C)
-void attention_backward(floatX* dqkvr_out, floatX* dpreatt_unused, floatX* datt, floatX* scratch,
+void attention_backward(floatX* dqkvr_out, floatX* scratch,
                         const floatX* dout,
-                        const floatX* qkvr, const floatX* att,
+                        const floatX* qkvr, floatX* att,
                         int B, int T, int C, int NH, cudaStream_t stream,
                         bool use_rope=false, float rope_theta=10000.0f) {
     NVTX_RANGE_FN();
@@ -394,14 +394,14 @@ void attention_backward(floatX* dqkvr_out, floatX* dpreatt_unused, floatX* datt,
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);
     unpermute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(scratch, dout, B, T, NH, HS);
-    // backward into datt
-    matmul_cublaslt(datt, v, scratch, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
+    // backward into pre-attention (dpreatt) and dv using att buffer as workspace
+    floatX* dpreatt = att; // reuse attention buffer for dpreatt (in-place ok)
+    matmul_cublaslt(dpreatt, v, scratch, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
     // backward into dv
     matmul_cublaslt(dv, scratch, att, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
     const float scale = 1.0f / sqrtf((float)HS);
-    // backward into preatt. this is an in-place operation; datt turns into dpreatt here
-    softmax_autoregressive_backward_inplace_kernel<<<dim3(T / 4, B * NH), 256>>>(datt, att, B, T, C, scale);
-    const floatX* dpreatt = datt;
+    // backward into preatt. this is an in-place operation on the att buffer
+    softmax_autoregressive_backward_inplace_kernel<<<dim3(T / 4, B * NH), 256>>>(dpreatt, att, B, T, C, scale);
     // backward into q
     matmul_cublaslt(dq, k, dpreatt, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
     // backward into k
