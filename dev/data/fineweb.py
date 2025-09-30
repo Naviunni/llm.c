@@ -39,6 +39,8 @@ parser.add_argument("-t", "--type", type=str, default="classic", help="Fineweb t
 parser.add_argument("-v", "--version", type=str, default="10B", help="Fineweb data sample size, 10B|100B")
 parser.add_argument("-m", "--model_desc", type=str, default="gpt-2", help="Model descriptor, gpt-2|llama-3")
 parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each data shard in the output .bin files, in tokens")
+parser.add_argument("--start_shard", type=int, default=0, help="Start writing from this shard index; earlier shards are skipped (not written)")
+parser.add_argument("--resume", action="store_true", help="Auto-detect last written shard in the output dir and continue from the next shard")
 args = parser.parse_args()
 
 # FineWeb has a few possible subsamples available
@@ -93,6 +95,20 @@ token_dtype = {
     "llama-3": np.uint32
 }[args.model_desc]
 
+# if resume is requested, auto-detect the last shard index and set start_shard
+if args.resume:
+    import re
+    pat = re.compile(rf"^{name}_(train|val)_(\d{{6}})\.bin$")
+    max_idx = -1
+    for fn in os.listdir(DATA_CACHE_DIR):
+        m = pat.match(fn)
+        if m:
+            idx = int(m.group(2))
+            if idx > max_idx:
+                max_idx = idx
+    args.start_shard = max(args.start_shard, max_idx + 1)
+    print(f"[resume] Detected last shard index {max_idx}, starting from shard {args.start_shard}")
+
 # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
 nprocs = max(1, os.cpu_count() - 2) # don't hog the entire system
 with mp.Pool(nprocs) as pool:
@@ -129,7 +145,11 @@ with mp.Pool(nprocs) as pool:
             remainder = args.shard_size - token_count
             progress_bar.update(remainder)
             all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
-            write_datafile(filename, all_tokens_np.tolist(), args.model_desc)
+            if shard_index >= args.start_shard:
+                write_datafile(filename, all_tokens_np.tolist(), args.model_desc)
+            else:
+                # skipping write for earlier shard indices
+                pass
             shard_index += 1
             progress_bar = None
             # populate the next shard with the leftovers of the current doc
@@ -140,4 +160,8 @@ with mp.Pool(nprocs) as pool:
     if token_count != 0:
         split = "val" if shard_index == 0 else "train"
         filename = os.path.join(DATA_CACHE_DIR, f"{name}_{split}_{shard_index:06d}.bin")
-        write_datafile(filename, (all_tokens_np[:token_count]).tolist(), args.model_desc)
+        if shard_index >= args.start_shard:
+            write_datafile(filename, (all_tokens_np[:token_count]).tolist(), args.model_desc)
+        else:
+            # skipping final partial shard write if before start_shard
+            pass

@@ -62,6 +62,8 @@ GPT-2 Transformer Neural Net training loop. See README.md for usage.
 #include "llmc/adamw.cuh"
 // defines: global_norm_squared
 #include "llmc/global_norm.cuh"
+// defines: moe_row_softmax_forward, moe_row_softmax_backward, moe_axpy_rowwise
+#include "llmc/moe.cuh"
 // ----------- Multi-GPU support -----------
 // defines: ncclFloatX, ncclCheck, MultiGpuConfig, ShardInfo
 // defines: printf0, multi_gpu_config
@@ -81,6 +83,10 @@ cudaStream_t main_stream;
 // buffer size to use for device <-> disk io
 constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 
+// pass-through for CLI MoE config into descriptor builder
+static int g_cli_moe_experts = 0;
+static int g_cli_moe_every = 0;
+
 // ----------------------------------------------------------------------------
 // GPT-2 model definition
 
@@ -91,10 +97,13 @@ typedef struct {
     int num_layers; // number of layers, e.g. 12
     int num_heads; // number of heads in attention, e.g. 12
     int channels; // number of channels, e.g. 768
+    // Mixture-of-Experts (MoE) config
+    int moe_experts;   // number of experts in MoE MLP (0 = disabled)
+    int moe_every;     // apply MoE every k layers (0 = disabled)
 } GPT2Config;
 
 // the parameters of the model
-constexpr const int NUM_PARAMETER_TENSORS = 16;
+constexpr const int NUM_PARAMETER_TENSORS = 22;
 typedef struct {
     floatX* wte; // (V, C)
     floatX* wpe; // (maxT, C)
@@ -112,6 +121,13 @@ typedef struct {
     floatX* fcprojb; // (L, C)
     floatX* lnfw; // (C)
     floatX* lnfb; // (C)
+    // MoE tensors (allocated only if moe_experts > 0 and moe_every > 0)
+    floatX* moe_routerw;  // (L, C, E)
+    floatX* moe_routerb;  // (L, E)
+    floatX* moe_fcw;      // (L, E, 4*C, C)
+    floatX* moe_fcb;      // (L, E, 4*C)
+    floatX* moe_fcprojw;  // (L, E, C, 4*C)
+    floatX* moe_fcprojb;  // (L, E, C)
 } ParameterTensors;
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
@@ -120,6 +136,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     size_t C = config.channels;
     size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
+    size_t E = (config.moe_experts > 0 && config.moe_every > 0) ? (size_t)config.moe_experts : 0;
     param_sizes[0] = Vp * C; // wte
     param_sizes[1] = maxT * C; // wpe
     param_sizes[2] = L * C; // ln1w
@@ -136,6 +153,13 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     param_sizes[13] = L * C; // fcprojb
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
+    // MoE params
+    param_sizes[16] = (E > 0) ? L * C * E : 0;        // moe_routerw
+    param_sizes[17] = (E > 0) ? L * E : 0;            // moe_routerb
+    param_sizes[18] = (E > 0) ? L * E * (4 * C) * C : 0; // moe_fcw
+    param_sizes[19] = (E > 0) ? L * E * (4 * C) : 0;     // moe_fcb
+    param_sizes[20] = (E > 0) ? L * E * C * (4 * C) : 0; // moe_fcprojw
+    param_sizes[21] = (E > 0) ? L * E * C : 0;           // moe_fcprojb
 
     // populate the parameter sizes in bytes (all the same for now, keeping for future use)
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -157,7 +181,9 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     floatX** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
-        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
+        &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb,
+        &params->moe_routerw, &params->moe_routerb, &params->moe_fcw, &params->moe_fcb,
+        &params->moe_fcprojw, &params->moe_fcprojb
     };
     char* params_memory_iterator = (char*)params_memory;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
@@ -167,7 +193,7 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     return params_memory;
 }
 
-constexpr int NUM_ACTIVATION_TENSORS = 21;
+constexpr int NUM_ACTIVATION_TENSORS = 23;
 typedef struct {
     floatX* encoded; // (B, T, C)
     floatX* ln1; // (L, B, T, C)
@@ -204,6 +230,9 @@ typedef struct {
     // some additional scratch buffers
     floatX* scratch_bt4c;   // (B, T, 4*C)
     floatX* scratch_btc;    // (B, T, C)
+    // MoE gating buffers
+    floatX* moe_gates;      // (L, B, T, E) if MoE enabled
+    floatX* moe_gates_grad; // (L, B, T, E) if MoE enabled
 } ActivationTensors;
 
 
@@ -221,6 +250,7 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
     size_t L = config.num_layers;
     size_t NH = config.num_heads;
     size_t C = config.channels;
+    size_t E = (config.moe_experts > 0 && config.moe_every > 0) ? (size_t)config.moe_experts : 0;
     tensors[0] = TENSOR_SPEC(data->encoded, B * T * C);
     // if recompute >= 1 then we will recompute the layernorm forward activation during backward pass
     tensors[1] = TENSOR_SPEC(data->ln1,  (recompute < 2) ? L * B * T * C : 0);
@@ -251,6 +281,8 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
 
     tensors[19] = TENSOR_SPEC(data->scratch_bt4c, B * T * 4 * C);
     tensors[20] = TENSOR_SPEC(data->scratch_btc, B * T * C);
+    tensors[21] = TENSOR_SPEC(data->moe_gates, (E > 0) ? L * B * T * E : 0);
+    tensors[22] = TENSOR_SPEC(data->moe_gates_grad, (E > 0) ? L * B * T * E : 0);
 }
 
 void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
@@ -443,6 +475,9 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model_header[5] = model->config.num_heads;
     model_header[6] = model->config.channels;
     model_header[7] = model->config.padded_vocab_size;
+    // extend header with MoE config
+    model_header[8] = model->config.moe_experts;
+    model_header[9] = model->config.moe_every;
     fwriteCheck(model_header, sizeof(int), 256, model_file);
     // write the parameters
     device_to_file(model_file, model->params_memory, model->num_parameters_bytes,
@@ -501,6 +536,9 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     model->config.num_heads = model_header[5];
     model->config.channels = model_header[6];
     model->config.padded_vocab_size = model_header[7];
+    // read optional MoE config (0 if not present)
+    model->config.moe_experts = model_header[8];
+    model->config.moe_every = model_header[9];
 
     // allocate memory for the model parameters
     gpt2_allocate_weights(model);
@@ -582,6 +620,10 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     model->config.vocab_size = 50257;
     model->config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
 
+    // Apply CLI MoE settings before allocating weights
+    model->config.moe_experts = g_cli_moe_experts;
+    model->config.moe_every = g_cli_moe_every;
+
     gpt2_allocate_weights(model);
 
     // allocate and random init the memory for all the parameters with GPT-2 schema
@@ -608,14 +650,15 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
             }
             // weights tensors are handled here
             if ((l == 0 && (i == 0 || i == 1)) // only at l = 0, init the wte and wpe tensors
-              || i == 4 || i == 6 || i == 10 || i == 12) {
+              || i == 4 || i == 6 || i == 10 || i == 12
+              || i == 16 || i == 18 || i == 20) {
                 size_t n = model->param_elements[i];
                 size_t layer_offset = 0;
                 if (i == 0) {
                     // for wte tensor (padded vocab) override to init V instead of Vp rows
                     n = model->config.vocab_size * model->config.channels;
                 }
-                if (i == 4 || i == 6 || i == 10 || i == 12) {
+                if (i == 4 || i == 6 || i == 10 || i == 12 || i == 16 || i == 18 || i == 20) {
                     // weight tensors, we are only initializing layer l
                     assert(n % L == 0);
                     n = n / L;
@@ -623,7 +666,7 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
                 }
                 // in GPT-2, the projections back into the residual stream are additionally
                 // scaled by 1/sqrt(2*L) for training stability
-                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+                float scale = (i == 6 || i == 12 || i == 20) ? 0.02f * residual_scale : 0.02f;
                 // okay let's draw the random numbers and write them
                 float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
                 normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
@@ -732,8 +775,42 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
 
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
-        matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
-        matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+
+        bool use_moe = (model->config.moe_experts > 0 && model->config.moe_every > 0 && ((l % model->config.moe_every) == (model->config.moe_every - 1)));
+        if (!use_moe) {
+            // Dense FFN
+            matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+            matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
+        } else {
+            // MoE FFN (dense experts with softmax gating)
+            const int E = model->config.moe_experts;
+            const size_t M = B * T;
+            // compute router logits into gates buffer then softmax in-place
+            floatX* l_gates = acts.moe_gates + l * B * T * E;
+            floatX* l_routerw = params.moe_routerw + l * C * E;
+            floatX* l_routerb = params.moe_routerb + l * E;
+            // logits
+            matmul_forward_cublaslt(l_gates, l_ln2, l_routerw, l_routerb, B, T, C, E, main_stream);
+            // softmax row-wise over E
+            moe_row_softmax_forward<floatX>(l_gates, l_gates, (int)M, E, main_stream);
+            // zero the scratch (accumulator for combined expert outputs)
+            cudaCheck(cudaMemsetAsync(scratch, 0, M * C * sizeof(floatX), main_stream));
+            for (int e = 0; e < E; ++e) {
+                // expert weight pointers
+                floatX* l_moe_fcw = params.moe_fcw + l * E * (4*C) * C + e * (4*C) * C;
+                floatX* l_moe_fcb = params.moe_fcb + l * E * (4*C) + e * (4*C);
+                floatX* l_moe_fcprojw = params.moe_fcprojw + l * E * C * (4*C) + e * C * (4*C);
+                floatX* l_moe_fcprojb = params.moe_fcprojb + l * E * C + e * C;
+                // hidden = gelu(x W1 + b1)
+                matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_moe_fcw, l_moe_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+                // y_e = hidden W2 + b2 -> put into scratch_btc
+                matmul_forward_cublaslt(acts.scratch_btc, l_fch_gelu, l_moe_fcprojw, l_moe_fcprojb, B, T, 4*C, C, main_stream);
+                // gates vector for expert e (shape M)
+                floatX* gate_e = l_gates + e; // interleaved by last dim E (stride E)
+                // accumulate: scratch += diag(gate_e) * y_e
+                moe_axpy_rowwise<floatX>(scratch, acts.scratch_btc, gate_e, (int)M, C, E, main_stream);
+            }
+        }
         // OK, fusion across blocks.
         if(l+1 != L) {
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
@@ -892,17 +969,68 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* dl_bt4c = (floatX*)model->acts.scratch_bt4c;
 
         // start the backward pass for this layer
-        if(model->recompute >= 1) {
-            // recompute >= 1 means we recompute gelu. in this case,
-            // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
-            gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
+        bool use_moe_bwd = (model->config.moe_experts > 0 && model->config.moe_every > 0 && ((l % model->config.moe_every) == (model->config.moe_every - 1)));
+        if (!use_moe_bwd) {
+            if(model->recompute >= 1) {
+                // recompute >= 1 means we recompute gelu. in this case,
+                // l_fch_gelu is just a buffer, so re-compute the gelu from l_fch here
+                gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
+            }
+            matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
+            if(model->recompute >= 2) {
+                // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
+                layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
+            }
+            matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
+        } else {
+            // MoE backward: accumulate over experts
+            const int E = model->config.moe_experts;
+            const size_t M = B * T;
+            floatX* l_gates = acts.moe_gates + l * B * T * E;
+            floatX* l_gates_grad = acts.moe_gates_grad + l * B * T * E;
+            // zero accumulators
+            cudaCheck(cudaMemsetAsync(dl_btc, 0, M * C * sizeof(floatX), main_stream));
+            cudaCheck(cudaMemsetAsync(l_gates_grad, 0, M * E * sizeof(floatX), main_stream));
+            for (int e = 0; e < E; ++e) {
+                // pointers
+                floatX* l_moe_fcw = params.fcw; // silence compiler if not used below
+                (void)l_moe_fcw;
+                floatX* moe_fcw_e = model->params.moe_fcw + l * E * (4*C) * C + e * (4*C) * C;
+                floatX* moe_fcb_e = model->params.moe_fcb + l * E * (4*C) + e * (4*C);
+                floatX* moe_fcprojw_e = model->params.moe_fcprojw + l * E * C * (4*C) + e * C * (4*C);
+                floatX* moe_fcprojb_e = model->params.moe_fcprojb + l * E * C + e * C;
+                floatX* dl_moe_fcw_e = model->grads.moe_fcw + l * E * (4*C) * C + e * (4*C) * C;
+                floatX* dl_moe_fcb_e = model->grads.moe_fcb + l * E * (4*C) + e * (4*C);
+                floatX* dl_moe_fcprojw_e = model->grads.moe_fcprojw + l * E * C * (4*C) + e * C * (4*C);
+                floatX* dl_moe_fcprojb_e = model->grads.moe_fcprojb + l * E * C + e * C;
+                floatX* gate_e = l_gates + e;
+                floatX* gate_grad_e = l_gates_grad + e;
+
+                // Recompute hidden and y_e for gate gradient and W2 backward
+                matmul_forward_cublaslt(l_fch_pre_gelu, l_ln2, moe_fcw_e, moe_fcb_e, B, T, C, 4*C, main_stream);
+                gelu_forward(l_fch_gelu, l_fch_pre_gelu, B*T*4*C, main_stream);
+                // y_e
+                matmul_forward_cublaslt(acts.scratch_btc, l_fch_gelu, moe_fcprojw_e, moe_fcprojb_e, B, T, 4*C, C, main_stream);
+
+                // gates grad contribution: dot over C of dresidual and y_e
+                moe_rowwise_dot_accum<floatX>(gate_grad_e, dresidual, acts.scratch_btc, (int)M, C, E, main_stream);
+                // grad wrt y_e = diag(gate_e) * dresidual
+                cudaCheck(cudaMemsetAsync(acts.scratch_btc, 0, M * C * sizeof(floatX), main_stream));
+                moe_axpy_rowwise<floatX>(acts.scratch_btc, dresidual, gate_e, (int)M, C, E, main_stream);
+                // backprop W2
+                matmul_backward(dl_bt4c, dl_moe_fcprojw_e, dl_moe_fcprojb_e, acts.scratch_btc, l_fch_gelu, moe_fcprojw_e, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
+                // backprop W1
+                matmul_backward(dl_btc, dl_moe_fcw_e, dl_moe_fcb_e, dl_bt4c, l_ln2, moe_fcw_e, scratchF, B, T, C, 4*C, main_stream);
+            }
+            // softmax backward on gates
+            moe_row_softmax_backward<floatX>(l_gates_grad, l_gates, l_gates_grad, (int)M, E, main_stream);
+            // router backward
+            floatX* l_routerw = params.moe_routerw + l * C * E;
+            floatX* dl_routerw = grads.moe_routerw + l * C * E;
+            floatX* l_routerb = params.moe_routerb + l * E;
+            floatX* dl_routerb = grads.moe_routerb + l * E;
+            matmul_backward(dl_btc, dl_routerw, dl_routerb, l_gates_grad, l_ln2, l_routerw, scratchF, B, T, C, E, main_stream);
         }
-        matmul_backward(dl_bt4c, dl_fcprojw, dl_fcprojb, dresidual, l_fch_gelu, l_fcprojw, scratchF, B, T, 4*C, C, main_stream, l_fch_pre_gelu, model->gelu_fusion);
-        if(model->recompute >= 2) {
-            // same as gelu above, l_ln1 and l_ln2 are just buffers if recompute >= 2, recompute them here on demand
-            layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
-        }
-        matmul_backward(dl_btc, dl_fcw, dl_fcb, dl_bt4c, l_ln2, l_fcw, scratchF, B, T, C, 4 * C, main_stream);
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
         matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
@@ -944,6 +1072,23 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                 C * 4 * C, C
             };
             multi_gpu_async_reduce_gradient(pointers, nelem, &multi_gpu_config, main_stream);
+            if (model->config.moe_experts > 0 && model->config.moe_every > 0 && ((l % model->config.moe_every) == (model->config.moe_every - 1))) {
+                const int E = model->config.moe_experts;
+                floatX* const moe_ptrs[] = {
+                    grads.moe_routerw + l * C * E,
+                    grads.moe_routerb + l * E,
+                    grads.moe_fcw + l * E * (4*C) * C,
+                    grads.moe_fcb + l * E * (4*C),
+                    grads.moe_fcprojw + l * E * C * (4*C),
+                    grads.moe_fcprojb + l * E * C
+                };
+                const size_t moe_nelem[] = {
+                    (size_t)(C * E), (size_t)E,
+                    (size_t)(E * 4 * C * C), (size_t)(E * 4 * C),
+                    (size_t)(E * C * 4 * C), (size_t)(E * C)
+                };
+                multi_gpu_async_reduce_gradient(moe_ptrs, moe_nelem, &multi_gpu_config, main_stream);
+            }
         }
     }
     encoder_backward(grads.wte, grads.wpe, scratchX, model->workload_indices, model->bucket_info,
@@ -982,7 +1127,7 @@ ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id, int param_te
     }
     size_t size = model->param_elements[param_tensor_id] ;
     // if we are in the transformer block, we need to additionally offset by the layer id
-    if(2 <= param_tensor_id && param_tensor_id <= 13) {
+    if(2 <= param_tensor_id && param_tensor_id <= 21) {
         size /= model->config.num_layers;
         offset += (ptrdiff_t)(layer_id * size);
     }
@@ -1064,7 +1209,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         unsigned int seed = random_u32(&model->rng_state);
 
         int num_layers = model->config.num_layers;
-        if((i < 2 || i > 13)) {
+        if((i < 2 || i > 21)) {
             num_layers = 1;
         }
 
@@ -1077,7 +1222,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         // in particular this also decays the embedding weights, but this is ok:
         // - the token embeddings are weight shared and participate in the final projection to logits
         // - the position embeddings actively participate at every forward/backward pass
-        float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12) ? weight_decay : 0.0f;
+        float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12 || i == 16 || i == 18 || i == 20) ? weight_decay : 0.0f;
         floatX* param_ptr = (floatX*)model->params_memory + local_offset_full;
         floatX* grad_ptr = (floatX*)model->grads_memory + local_offset_full;
 
@@ -1401,6 +1546,9 @@ void error_usage() {
     fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
     fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
     fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 2 for >=SM90, 0 for older GPUs)\n");
+    // Mixture-of-Experts
+    fprintf(stderr, "  -me <int>   MoE experts per MoE layer (0=off)\n");
+    fprintf(stderr, "  -ml <int>   MoE every k layers (e.g., 2 = every other layer)\n");
     // memory management
     fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
     fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
@@ -1449,6 +1597,9 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    // MoE (CLI)
+    int cli_moe_experts = 0;
+    int cli_moe_every = 0;
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1477,7 +1628,9 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == '\0') { val_max_steps = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == 'e') { cli_moe_experts = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm' && argv[i][2] == 'l') { cli_moe_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g' && argv[i][2] == 'e') { gelu_fusion = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
@@ -1500,6 +1653,10 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
         else { error_usage(); }
     }
+
+    // propagate MoE CLI into globals for descriptor builder
+    g_cli_moe_experts = cli_moe_experts;
+    g_cli_moe_every = cli_moe_every;
 
     multi_gpu_config = multi_gpu_config_init(num_processes, process_rank, gpus_per_node, server_ip, fs_path, nccl_init_method);
     common_start(override_enable_tf32, false); // common init code for train/test/profile
@@ -1596,6 +1753,8 @@ int main(int argc, char *argv[]) {
     printf0("| num_heads NH          | %-50d |\n", model.config.num_heads);
     printf0("| channels C            | %-50d |\n", model.config.channels);
     printf0("| num_parameters        | %-50zu |\n", model.num_parameters);
+    printf0("| MoE experts           | %-50d |\n", model.config.moe_experts);
+    printf0("| MoE every k layers    | %-50d |\n", model.config.moe_every);
     printf0("+-----------------------+----------------------------------------------------+\n");
 
     // build DataLoaders for both train and val
