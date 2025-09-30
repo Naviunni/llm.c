@@ -387,9 +387,9 @@ void attention_backward(floatX* dqkvr_out, floatX* dpreatt_unused, floatX* datt,
     k = qkvr + 1 * B * T * C;
     v = qkvr + 2 * B * T * C;
     floatX *dq, *dk, *dv;
-    dq = dqkvr + 0 * B * T * C;
-    dk = dqkvr + 1 * B * T * C;
-    dv = dqkvr + 2 * B * T * C;
+    dq = dqkvr_out + 0 * B * T * C;
+    dk = dqkvr_out + 1 * B * T * C;
+    dv = dqkvr_out + 2 * B * T * C;
 
     // backward through the unpermute operation
     int num_blocks = CEIL_DIV(B * T * C, block_size);
