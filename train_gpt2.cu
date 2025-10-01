@@ -970,8 +970,11 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* l_attprojw = params.attprojw + l * C * C;
         floatX* l_ln2w = params.ln2w + l * C;
         floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
+        size_t Ci = (8 * C + 2) / 3;
+        floatX* l_fcw = params.fcw + l * Ci * C;         // up
+        floatX* l_fcprojw = params.fcprojw + l * C * Ci; // down
+        floatX* l_fcgatew = params.fcgatew + l * Ci * C; // gate
+        floatX* l_fcgateb = params.fcgateb + l * Ci;     // gate bias (not used here)
         // get the pointers of the gradients of the weights for this layer
         floatX* dl_ln1w = grads.ln1w + l * C;
         floatX* dl_ln1b = grads.ln1b + l * C;
@@ -981,7 +984,7 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
         floatX* dl_attprojb = grads.attprojb + l * C;
         floatX* dl_ln2w = grads.ln2w + l * C;
         floatX* dl_ln2b = grads.ln2b + l * C;
-        size_t Ci = (8 * C + 2) / 3;
+        // Ci already defined above
         floatX* dl_fcw = grads.fcw + l * Ci * C;
         floatX* dl_fcb = grads.fcb + l * Ci;
         floatX* dl_fcprojw = grads.fcprojw + l * C * Ci;
