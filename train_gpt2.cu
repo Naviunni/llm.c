@@ -288,8 +288,14 @@ void fill_in_activation_sizes(const ActivationTensors* data, TensorSpec (&tensor
 }
 
 void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
+    // ensure 16-byte alignment for all activation tensor pointers to satisfy cuBLASLt
+    auto align_up = [](size_t x, size_t a) { return (x + (a - 1)) & ~(a - 1); };
+
+    // first pass: compute total bytes including per-tensor 16B alignment padding
     size_t bytes = 0;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+        if (tensors[i].size == 0) { continue; }
+        bytes = align_up(bytes, 16);
         bytes += tensors[i].size * sizeof_dtype(tensors[i].type);
     }
 
@@ -300,15 +306,17 @@ void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]
 
     // cudaMalloc does not guarantee initial memory values so we memset the allocation here
     // this matters because e.g. non-cuDNN attention assumes the attention buffer is zeroed
-    // todo - up to ~100ms on slow GPUs, could theoretically be more selective, but this is safer
     cudaCheck(cudaMemset(acts_memory, 0, bytes));
 
+    // second pass: assign aligned pointers
     char* acts_memory_iterator = (char*)acts_memory;
     for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-        // extra protection so we don't accidentally use an empty buffer
         if(tensors[i].size == 0) {
             *(tensors[i].ptr) = NULL;
-        }else {
+        } else {
+            uintptr_t it = (uintptr_t)acts_memory_iterator;
+            it = align_up(it, (size_t)16);
+            acts_memory_iterator = (char*)it;
             *(tensors[i].ptr) = acts_memory_iterator;
             acts_memory_iterator += tensors[i].size * sizeof_dtype(tensors[i].type);
         }
@@ -1032,8 +1040,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             cudaCheck(cudaMemsetAsync(l_gates_grad, 0, M * E * sizeof(floatX), main_stream));
             for (int e = 0; e < E; ++e) {
                 // pointers
-                floatX* l_moe_fcw = params.fcw; // silence compiler if not used below
-                (void)l_moe_fcw;
                 floatX* moe_fcw_e = model->params.moe_fcw + l * E * (4*C) * C + e * (4*C) * C;
                 floatX* moe_fcb_e = model->params.moe_fcb + l * E * (4*C) + e * (4*C);
                 floatX* moe_fcprojw_e = model->params.moe_fcprojw + l * E * C * (4*C) + e * C * (4*C);
@@ -1066,7 +1072,6 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             // router backward
             floatX* l_routerw = params.moe_routerw + l * C * E;
             floatX* dl_routerw = grads.moe_routerw + l * C * E;
-            floatX* l_routerb = params.moe_routerb + l * E;
             floatX* dl_routerb = grads.moe_routerb + l * E;
             matmul_backward(dl_btc, dl_routerw, dl_routerb, l_gates_grad, l_ln2, l_routerw, scratchF, B, T, C, E, main_stream);
         }
