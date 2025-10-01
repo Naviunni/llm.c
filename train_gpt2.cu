@@ -171,9 +171,13 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
 
 // allocate memory for the parameters and point the individual tensors to the right places
 void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
-    // calculate the total number of parameters and bytes across all tensors
+    // ensure 16-byte alignment for all parameter tensor pointers
+    auto align_up = [](size_t x, size_t a) { return (x + (a - 1)) & ~(a - 1); };
+    // calculate the total number of parameters and bytes across all tensors, including padding
     size_t num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        if (param_elements[i] == 0) continue;
+        num_parameters_bytes = align_up(num_parameters_bytes, 16);
         num_parameters_bytes += param_elements[i] * param_sizeof[i];
     }
     // malloc all parameters all at once on the device
@@ -189,6 +193,13 @@ void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elemen
     };
     char* params_memory_iterator = (char*)params_memory;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        if (param_elements[i] == 0) {
+            *(ptrs[i]) = NULL;
+            continue;
+        }
+        uintptr_t it = (uintptr_t)params_memory_iterator;
+        it = align_up(it, (size_t)16);
+        params_memory_iterator = (char*)it;
         *(ptrs[i]) = (floatX*)params_memory_iterator;
         params_memory_iterator += param_elements[i] * param_sizeof[i];
     }
