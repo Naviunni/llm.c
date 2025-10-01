@@ -139,6 +139,11 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     size_t maxT = config.max_seq_len;
     size_t L = config.num_layers;
     size_t E = (config.moe_experts > 0 && config.moe_every > 0) ? (size_t)config.moe_experts : 0;
+    // alignment requirements: ensure per-layer strides are multiples of 16 bytes
+    const size_t align_bytes = 16;
+    const size_t elem_size = sizeof(floatX);
+    const size_t align_elems = align_bytes / elem_size; // 8 for bf16, 4 for fp32
+    auto align_up_elems = [&](size_t x) { return (align_elems > 0) ? ((x + align_elems - 1) / align_elems) * align_elems : x; };
     param_sizes[0] = Vp * C; // wte
     param_sizes[1] = maxT * C; // wpe
     param_sizes[2] = L * C; // ln1w
@@ -155,9 +160,10 @@ void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Conf
     param_sizes[13] = L * C; // fcprojb
     param_sizes[14] = C; // lnfw
     param_sizes[15] = C; // lnfb
-    // MoE params
+    // MoE params (pad routerb stride per layer to alignment to keep bias pointers 16B aligned)
     param_sizes[16] = (E > 0) ? L * C * E : 0;        // moe_routerw
-    param_sizes[17] = (E > 0) ? L * E : 0;            // moe_routerb
+    size_t E_padded = (E > 0) ? align_up_elems(E) : 0;
+    param_sizes[17] = (E > 0) ? L * E_padded : 0;     // moe_routerb (padded stride)
     param_sizes[18] = (E > 0) ? L * E * (4 * C) * C : 0; // moe_fcw
     param_sizes[19] = (E > 0) ? L * E * (4 * C) : 0;     // moe_fcb
     param_sizes[20] = (E > 0) ? L * E * C * (4 * C) : 0; // moe_fcprojw
@@ -833,7 +839,10 @@ void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
             // compute router logits into gates buffer then softmax in-place
             floatX* l_gates = acts.moe_gates + l * B * T * E;
             floatX* l_routerw = params.moe_routerw + l * C * E;
-            floatX* l_routerb = params.moe_routerb + l * E;
+            // bias per-layer stride is padded to keep 16B alignment of bias pointer
+            const int align_elems = 16 / (int)sizeof(floatX);
+            const int E_padded = ((E + align_elems - 1) / align_elems) * align_elems;
+            floatX* l_routerb = params.moe_routerb + l * E_padded;
             // logits
             matmul_forward_cublaslt(l_gates, l_ln2, l_routerw, l_routerb, B, T, C, E, main_stream);
             // softmax row-wise over E
@@ -1083,7 +1092,9 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
             // router backward
             floatX* l_routerw = params.moe_routerw + l * C * E;
             floatX* dl_routerw = grads.moe_routerw + l * C * E;
-            floatX* dl_routerb = grads.moe_routerb + l * E;
+            const int align_elems_rb = 16 / (int)sizeof(floatX);
+            const int E_padded_b = ((E + align_elems_rb - 1) / align_elems_rb) * align_elems_rb;
+            floatX* dl_routerb = grads.moe_routerb + l * E_padded_b;
             matmul_backward(dl_btc, dl_routerw, dl_routerb, l_gates_grad, l_ln2, l_routerw, scratchF, B, T, C, E, main_stream);
         }
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
@@ -1149,14 +1160,14 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
                 const int E = model->config.moe_experts;
                 floatX* const moe_ptrs[] = {
                     grads.moe_routerw + l * C * E,
-                    grads.moe_routerb + l * E,
+                    grads.moe_routerb + l * (((E + (16/(int)sizeof(floatX)) - 1) / (16/(int)sizeof(floatX))) * (16/(int)sizeof(floatX))),
                     grads.moe_fcw + l * E * (4*C) * C,
                     grads.moe_fcb + l * E * (4*C),
                     grads.moe_fcprojw + l * E * C * (4*C),
                     grads.moe_fcprojb + l * E * C
                 };
                 const size_t moe_nelem[] = {
-                    (size_t)(C * E), (size_t)E,
+                    (size_t)(C * E), (size_t)((((size_t)E + (16/sizeof(floatX)) - 1) / (16/sizeof(floatX))) * (16/sizeof(floatX))),
                     (size_t)(E * 4 * C * C), (size_t)(E * 4 * C),
                     (size_t)(E * C * 4 * C), (size_t)(E * C)
                 };

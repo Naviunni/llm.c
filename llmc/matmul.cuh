@@ -117,7 +117,8 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
 
     // check alignment (some modes work unaligned but it always best to be aligned for performance)
     if(((uintptr_t)a % 16) != 0 || ((uintptr_t)b % 16) != 0 || ((uintptr_t)d % 16) != 0 || ((uintptr_t)bias % 16) != 0) {
-        printf("All cuBLASLt pointers must be aligned!\n");
+        printf("All cuBLASLt pointers must be aligned! a=%p b=%p d=%p bias=%p m=%d n=%d k=%d transA=%d transB=%d has_bias=%d has_gelu=%d\n",
+               (const void*)a, (const void*)b, (const void*)d, (const void*)bias, m, n, k, (int)transA, (int)transB, (int)has_bias, (int)has_gelu);
         exit(EXIT_FAILURE);
     }
 
