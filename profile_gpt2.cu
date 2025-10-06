@@ -42,6 +42,16 @@ int main(int argc, char *argv[]) {
     gpt2_init_common(&model);
     gpt2_build_from_checkpoint(&model, "gpt2_124M_bf16.bin");
 
+    // optional CLI overrides: -R 1 to profile RMSNorm, -P 1 for RoPE, -RT <float> theta
+    for (int i = 1; i < argc; i+=2) {
+        if (i + 1 >= argc) { break; }
+        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { break; }
+        if (argv[i][0] != '-') { break; }
+        if (argv[i][1] == 'R' && argv[i][2] == '\0') { model.use_rmsnorm = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'P') { model.use_rope = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'R' && argv[i][2] == 'T') { model.rope_theta = atof(argv[i+1]); }
+    }
+
     int B = 24; // if program OOMs decrease this number, e.g. all the way down to 4 or etc
     int T = 1024; // if even that OOMs move on to this one. keep them nice and powers of 2
     printf("batch size: %d\n", B);
